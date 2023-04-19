@@ -2,6 +2,8 @@
 
 This is barely an implementation of a WiFi 802.11 Access Point, using Scapy
 
+![DALL·E 2022-09-08 18 16 58 - synthwave wifi turtle](https://user-images.githubusercontent.com/37549748/233028230-1cf2ecc0-2f75-4f41-b339-eb3e987369b1.png)
+
 ## What
 
 On Linux, this code lets you spin up a python access point with AES CCMP encryption.
