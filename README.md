@@ -21,13 +21,17 @@ Cryptodome's AES CCM implementation to show off all of the individual building b
 
 Build the container with ./build.sh and then run it with ./setup.sh
 
-```
+```bash
 ./build.sh
 ./setup.sh
 ```
 
-```
+Inspect IP network traffic
+```bash
 docker exec -it barely-ap tcpdump -i scapyap
 ```
 
-You can check on the various network interfaces
+```bash
+docker exec -it barely-sta tcpdump -i wlan1
+```
+
