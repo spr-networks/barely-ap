@@ -1,0 +1,6 @@
+#!/bin/sh
+IFACE=wlan1
+
+ip addr add dev wlan1 10.1.2.2/24
+stdbuf --output=L wpa_supplicant -B -Dnl80211 -i${IFACE} -c /client.conf | tee cli-supplicant.txt
+stdbuf --output=L ping 10.1.2.1 | tee cli-log.txt
