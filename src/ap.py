@@ -311,7 +311,7 @@ def is_broadcast(ether):
     return ether == "ff:ff:ff:ff:ff:ff"
 
 def is_multicast(ether):
-    return int(ether[0], 16) & 0x1 == 1
+    return int(ether[0:2], 16) & 0x1 == 1
 
 
 ### CCMP wrapper. See RFC 3610
