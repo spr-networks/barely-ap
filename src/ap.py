@@ -26,15 +26,15 @@ import threading
 import binascii
 import subprocess
 
-
 from scapy.layers.eap import EAPOL
 from scapy.layers.dot11 import *
 from scapy.layers.l2 import LLC, SNAP
-from scapy.layers.dhcp import *
 from scapy.fields import *
 from scapy.arch import str2mac, get_if_raw_hwaddr
 
 from time import time, sleep
+from fakenet import ScapyNetwork
+from ccmp import *
 
 
 class Level:
@@ -48,9 +48,9 @@ class Level:
 VERBOSITY = Level.BLOAT
 
 
-def printd(string, level):
+def printd(string, level=Level.INFO):
     if VERBOSITY >= level:
-        print(string)
+        print(string, file=sys.stderr)
 
 
 ### Constants
@@ -92,6 +92,9 @@ IFF_TAP = 0x0002
 IFF_NO_PI = 0x1000
 TUNSETIFF = 0x400454CA
 
+
+def if_hwaddr(iff):
+    return str2mac(get_if_raw_hwaddr(iff)[1])
 
 def set_ip_address(dev, ip):
     if subprocess.call(["ip", "addr", "add", ip, "dev", dev]):
@@ -150,7 +153,6 @@ class Station:
         self.mac = mac
         self.associated = False
 
-
 # Ripped from scapy-latest with fixes
 class EAPOL_KEY(Packet):
     name = "EAPOL_KEY"
@@ -205,251 +207,24 @@ class EAPOL_KEY(Packet):
             return 1
         return 0
 
-
-def pad_key_data(plain):
-    pad_len = len(plain) % 8
-    if pad_len:
-        plain += b"\xdd" * (8 - pad_len)
-    return plain
-
-
-#### Helpers from maty van hoef's libwifi
-def ccmp_pn(pn):
-    return pn.PN0 + (pn.PN1 << 8) + (pn.PN2 << 16) + (pn.PN3 << 24)
-
-
-def addr2bin(addr):
-    return binascii.a2b_hex(addr.replace(":", ""))
-
-
-def ccmp_get_nonce(priority, addr, pn):
-    """
-    CCMP nonce = 1 byte priority, 6 byte sender addr, 6 byte PN.
-    """
-    return struct.pack("B", priority) + addr2bin(addr) + pn2bin(pn)
-
-
-def ccmp_get_aad(p, amsdu_spp=False):
-    # FC field with masked values
-    fc = raw(p)[:2]
-    # data mask
-    fc = struct.pack("<BB", fc[0] & 0x8F, fc[1] & 0xC7)
-
-    # Sequence number is masked, but fragment number is included
-    sc = struct.pack("<H", p.SC & 0xF)
-
-    addr1 = addr2bin(p.addr1)
-    addr2 = addr2bin(p.addr2)
-    addr3 = addr2bin(p.addr3)
-    aad = fc + addr1 + addr2 + addr3 + sc
-    if Dot11QoS in p:
-        if not amsdu_spp:
-            # Everything except the TID is masked
-            aad += struct.pack("<H", p[Dot11QoS].TID)
-        else:
-            # TODO: Mask unrelated fields
-            aad += raw(p[Dot11QoS])[:2]
-    return aad
-
-
-def pn2bytes(pn):
-    pn_bytes = [0] * 6
-    for i in range(6):
-        pn_bytes[i] = pn & 0xFF
-        pn >>= 8
-    return pn_bytes
-
-
-def pn2bin(pn):
-    return struct.pack(">Q", pn)[2:]
-
-
-def dot11_get_seqnum(p):
-    return p.SC >> 4
-
-
-def dot11_is_encrypted_data(p):
-    # All these different cases are explicitly tested to handle older scapy versions
-    return (
-        (p.FCfield & 0x40)
-        or Dot11CCMP in p
-        or Dot11TKIP in p
-        or Dot11WEP in p
-        or Dot11Encrypted in p
-    )
-
-
-def payload_to_iv(payload):
-    iv0 = payload[0]
-    iv1 = payload[1]
-    wepdata = payload[4:8]
-
-    # FIXME: Only CCMP is supported (TKIP uses a different IV structure)
-    return orb(iv0) + (orb(iv1) << 8) + (struct.unpack(">I", wepdata)[0] << 16)
-
-
-def dot11_get_priority(p):
-    if not Dot11QoS in p:
-        return 0
-    return p[Dot11QoS].TID
-
-
-def dot11_get_iv(p):
-    # The simple and default case
-    if Dot11CCMP in p:
-        payload = raw(p[Dot11CCMP])
-        return payload_to_iv(payload)
-    # Scapy uses Dot11Encrypted if it couldn't determine how the frame was encrypted. Assume CCMP.
-    elif Dot11Encrypted in p:
-        payload = raw(p[Dot11Encrypted])
-        return payload_to_iv(payload)
-    # Couldn't determine the IV
-    return None
-
-
-def is_broadcast(ether):
-    return ether == "ff:ff:ff:ff:ff:ff"
-
-def is_multicast(ether):
-    return int(ether[0:2], 16) & 0x1 == 1
-
-
-### CCMP wrapper. See RFC 3610
-class CCMPCrypto:
-    @staticmethod
-    def cbc_mac(key, plaintext, aad, nonce, iv=b"\x00" * 16, mac_len=8):
-        assert len(key) == len(iv) == 16  # aes-128
-        assert len(nonce) == 13
-        iv = int.from_bytes(iv, byteorder="big")
-        assert len(aad) < (2**16 - 2**8)
-
-        q = L = 2
-        Mp = (mac_len - 2) // 2
-        assert q == L
-        has_aad = len(aad) > 0
-        flags = 64 * has_aad + 8 * Mp + (q - 1)
-        b_0 = struct.pack("B", flags) + nonce + struct.pack(">H", len(plaintext))
-        assert len(b_0) == 16
-
-        a = struct.pack(">H", len(aad)) + aad
-        if len(a) % 16 != 0:
-            a += b"\x00" * (16 - len(a) % 16)
-        blocks = b_0 + a
-        blocks += plaintext
-
-        if len(blocks) % 16 != 0:
-            blocks += b"\x00" * (16 - len(blocks) % 16)
-
-        encrypt = pyaes.AESModeOfOperationECB(key).encrypt
-        prev = iv
-        for i in range(0, len(blocks), 16):
-            inblock = int.from_bytes(blocks[i : i + 16], byteorder="big")
-            outblock = encrypt(int.to_bytes(inblock ^ prev, length=16, byteorder="big"))
-            prev = int.from_bytes(outblock, byteorder="big")
-
-        # xor tag with E(0) construction using nonce in CTR mode
-        xn = struct.pack("B", q - 1) + nonce + b"\x00" * L
-        ctr_nonce = int.from_bytes(xn, byteorder="big")
-        xctr = pyaes.AESModeOfOperationCTR(
-            key, counter=pyaes.Counter(ctr_nonce)
-        ).encrypt
-        xs0 = xctr(b"\x00" * 16)
-        s_0 = int.from_bytes(xs0, byteorder="big")
-
-        return int.to_bytes(s_0 ^ prev, length=16, byteorder="big")[:mac_len]
-
-    @staticmethod
-    def ctr_encrypt(key, nonce, plaintext, q=2, L=2):
-        xn = struct.pack("B", q - 1) + nonce + b"\x00" * L
-        ctr_nonce = int.from_bytes(xn, byteorder="big")
-        xctr = pyaes.AESModeOfOperationCTR(key, counter=pyaes.Counter(ctr_nonce))
-        # start ctr
-        _ = xctr.encrypt(b"\x00" * 16)
-        return xctr.encrypt(plaintext)
-
-    @staticmethod
-    def run_ccmp_encrypt(key, nonce, aad, plaintext):
-        tag = CCMPCrypto.cbc_mac(key, plaintext, aad, nonce)
-        encrypted = CCMPCrypto.ctr_encrypt(key, nonce, plaintext)
-        return encrypted, tag
-
-    @staticmethod
-    def run_ccmp_decrypt(key, nonce, aad, ciphertext, known_tag):
-        valid = False
-        # ctr encrypt/decrypt is symmetric
-        plaintext = CCMPCrypto.ctr_encrypt(key, nonce, ciphertext)
-        tag = CCMPCrypto.cbc_mac(key, plaintext, aad, nonce)
-        # constant time compare validity of tag
-        valid = hmac.compare_digest(tag, known_tag)
-        return plaintext, valid
-
-    @staticmethod
-    def test():
-        k = b"k" * 16
-        a = b"a" * 22
-        n = b"n" * 13
-        p = b"P" * 128
-        cipher, tag = CCMPCrypto.run_ccmp_encrypt(k, n, a, p)
-        p2, verified = CCMPCrypto.run_ccmp_decrypt(k, n, a, cipher, tag)
-        assert p == p2
-        assert verified
-        return True
-
-def if_hwaddr(iff):
-    return str2mac(get_if_raw_hwaddr(iff)[1])
-
-def aes_wrap(kek, plain):
-    n = len(plain) // 8
-    a = 0xA6A6A6A6A6A6A6A6
-    enc = pyaes.AESModeOfOperationECB(kek).encrypt
-    r = [plain[i * 8 : (i + 1) * 8] for i in range(0, n)]
-    for j in range(6):
-        for i in range(1, n + 1):
-            b = enc(struct.pack(">Q", a) + r[i - 1])
-            a = struct.unpack(">Q", b[:8])[0] ^ (n * j + i)
-            r[i - 1] = b[8:]
-    return struct.pack(">Q", a) + b"".join(r)
-
-
-def customPRF512(key, amac, smac, anonce, snonce):
-    """Source https://stackoverflow.com/questions/12018920/"""
-    A = b"Pairwise key expansion"
-    B = b"".join(sorted([amac, smac]) + sorted([anonce, snonce]))
-    num_bytes = 64
-    R = b""
-    for i in range((num_bytes * 8 + 159) // 160):
-        R += hmac.new(key, A + chb(0x00) + B + chb(i), hashlib.sha1).digest()
-    return R[:num_bytes]
-
-
-class AP:
-    def __init__(self, iface, ssid, psk):
-        self.IPS = []
-        self.stations = {}
-        self.interface = iface
+class BSS:
+    def __init__(self, ap, ssid, mac, psk, ip="10.10.10.1/24", mode="tunnel" ):
+        self.ap = ap
+        self.ssid = ssid
+        self.mac = mac
         self.PSK = psk
-        self.ssids = [ssid]
-        self.current_ssid_index = 0
-        self.mac = if_hwaddr(iface)
-        self.channel = 1
-        self.mutex = threading.Lock()
+        self.ip =  ip
         self.sc = 0
         self.aid = 0
-        self.boottime = time()
-        self.bpffilter = "not ( wlan type mgt subtype beacon )"
-        # " and ((ether dst host " + self.mac + ") or (ether dst host ff:ff:ff:ff:ff:ff))"
-        self.hidden = False
-        self.ip = "10.1.2.1/24"
-
-        self.beaconTransmitter = self.BeaconTransmitter(self)
-        self.tunnel = TunInterface(self)
-
-    def get_radiotap_header(self):
-        return RadioTap()
-
-    def get_ssid(self):
-        if len(self.ssids) > 0:
-            return self.ssids[self.current_ssid_index]
+        self.stations = {}
+        self.GTK = b""
+        self.mutex = threading.Lock()
+        if mode == "tunnel":
+            # use a TUN device
+            self.network = TunInterface(self)
+        else:
+            # use a fake scapy network
+            self.network = ScapyNetwork(self, ip=ip)
 
     def next_sc(self):
         self.mutex.acquire()
@@ -466,18 +241,46 @@ class AP:
         self.mutex.release()
         return temp
 
-    def current_timestamp(self):
-        return int((time() - self.boottime) * 1000000)
-
     def gen_gtk(self):
         self.gtk_full = open("/dev/urandom", "rb").read(32)
         self.GTK = self.gtk_full[:16]
         self.MIC_AP_TO_GROUP = self.gtk_full[16:24]
         self.group_IV = count()
 
-    def tun_data_incoming(self, incoming):
+
+class AP:
+    def __init__(self, ssid, psk, mac=None, mode="stdio", iface="wlan0"):
+        self.iface = iface
+        self.mode = mode
+        if self.mode == "iface":
+            mac = if_hwaddr(iface)
+        if not mac:
+          raise Exception("Need a mac")
+        else:
+          self.mac = mac
+        self.channel = 1
+        self.boottime = time()
+
+        self.bssids = {mac: BSS(self, ssid, mac, psk, "10.10.0.1/24")}
+        self.beaconTransmitter = self.BeaconTransmitter(self)
+
+    def ssids(self):
+        return [bss[x].ssid for x in self.bssids]
+
+    def get_radiotap_header(self):
+        return RadioTap()
+
+    def get_ssid(self, mac):
+        if mac not in self.bssids:
+            return None
+        return self.bssids[mac].ssid
+
+    def current_timestamp(self):
+        return int((time() - self.boottime) * 1000000)
+
+    def tun_data_incoming(self, bss, sta, incoming):
         p = Ether(incoming)
-        self.enc_send(p.dst, p)
+        self.enc_send(bss, sta, p)
 
     def recv_pkt(self, packet):
         try:
@@ -500,14 +303,22 @@ class AP:
             elif Dot11CCMP in packet:
                 if packet[Dot11].FCfield == "to-DS+protected":
                     sta = packet[Dot11].addr2
-                    decrypted = self.decrypt(sta, packet)
+                    bssid = packet[Dot11].addr1
+                    if bssid not in self.bssids:
+                        printd("[-] Invalid bssid destination for packet")
+                        return
+                    decrypted = self.decrypt(bssid, sta, packet)
                     if decrypted:
                         # make sure that the ethernet src matches the station,
                         # otherwise block
                         if sta != decrypted[Ether].src:
-                            print("[-] Invalid mac address for packet")
+                            printd("[-] Invalid mac address for packet")
                             return
-                        self.tunnel.write(decrypted)
+                        #self.tunnel.write(decrypted)
+                        #printd("write to %s from %s" % (bssid, sta))
+                        self.bssids[bssid].network.write(decrypted) #packet from a client
+                    else:
+                        printd("failed to decrypt %s to %s" % (sta, bssid))
                     return
 
             # Management
@@ -522,34 +333,40 @@ class AP:
                             Level.DEBUG,
                         )
 
-                        # Only send a probe response if one of our own SSIDs is probed
-                        if ssid in self.ssids or (
-                            Dot11Elt in packet and packet[Dot11Elt].len == 0
-                        ):
-                            if not (self.hidden and ssid != self.get_ssid()):
-                                self.dot11_probe_resp(packet.addr2, self.get_ssid())
+                        if Dot11Elt in packet and packet[Dot11Elt].len == 0:
+                            # for empty return primary ssid
+                            self.dot11_probe_resp(self.mac, packet.addr2, self.bssids[self.mac].ssid)
+                        else:
+                            # otherwise return match
+                            for x in self.bssids:
+                                # otherwise only respond to a match
+                                if self.bssids[x].ssid == ssid:
+                                    self.dot11_probe_resp(x, packet.addr2, ssid)
+                                    break
                 elif packet.subtype == DOT11_SUBTYPE_AUTH_REQ:  # Authentication
-                    if packet.addr1 == self.mac:  # We are the receivers
-                        self.sc = -1  # Reset sequence number
-                        self.dot11_auth(packet.addr2)
+                    bssid = packet.addr1
+                    if bssid in self.bssids:  # We are the receivers
+                        self.bssids[bssid].sc = -1 # Reset sequence number
+                        self.dot11_auth(bssid, packet.addr2)
                 elif (
                     packet.subtype == DOT11_SUBTYPE_ASSOC_REQ
                     or packet.subtype == DOT11_SUBTYPE_REASSOC_REQ
                 ):
-                    if packet.addr1 == self.mac:
+                    if packet.addr1 in self.bssids:
                         self.dot11_assoc_resp(packet, packet.addr2, packet.subtype)
         except SyntaxError as err:
-            print("Unknown error at monitor interface: %s" % repr(err))
+            printd("Unknown error at monitor interface: %s" % repr(err))
 
-    def dot11_probe_resp(self, source, ssid):
+    def dot11_probe_resp(self, bssid, source, ssid):
+        printd("send probe response to " +  source)
         probe_response_packet = (
             self.get_radiotap_header()
             / Dot11(
                 subtype=5,
                 addr1=source,
-                addr2=self.mac,
-                addr3=self.mac,
-                SC=self.next_sc(),
+                addr2=bssid,
+                addr3=bssid,
+                SC=self.bssids[bssid].next_sc(),
             )
             / Dot11ProbeResp(
                 timestamp=self.current_timestamp(), beacon_interval=0x0064, cap=0x3101
@@ -562,54 +379,58 @@ class AP:
         # If we are an RSN network, add RSN data to response
         probe_response_packet = probe_response_packet / RSN
 
-        sendp(probe_response_packet, iface=self.interface, verbose=False)
+        self.sendp(probe_response_packet, verbose=False)
 
-    def dot11_auth(self, receiver):
+    def dot11_auth(self, bssid, receiver):
+        bss = self.bssids[bssid]
         auth_packet = (
             self.get_radiotap_header()
             / Dot11(
                 subtype=0x0B,
                 addr1=receiver,
-                addr2=self.mac,
-                addr3=self.mac,
-                SC=self.next_sc(),
+                addr2=bssid,
+                addr3=bssid,
+                SC=bss.next_sc(),
             )
             / Dot11Auth(seqnum=0x02)
         )
 
-        printd("Sending Authentication (0x0B)...", Level.DEBUG)
-        sendp(auth_packet, iface=self.interface, verbose=False)
-
-    def dot11_ack(self, receiver):
-        ack_packet = self.get_radiotap_header() / Dot11(
-            type="Control", subtype=0x1D, addr1=receiver
-        )
-
-        print("Sending ACK (0x1D) to %s ..." % receiver)
-        sendp(ack_packet, iface=self.interface, verbose=False)
+        printd("Sending Authentication  from %s to %s (0x0B)..." % (receiver, bssid), Level.DEBUG)
+        self.sendp(auth_packet, verbose=False)
 
     def create_eapol_3(self, message_2):
+        bssid = message_2.getlayer(Dot11).addr1
         sta = message_2.getlayer(Dot11).addr2
-        if sta == self.mac:
-            return
-        if sta not in self.stations:
-            print("not there", sta)
+
+        printd("eapol 3 incoming " + sta + " " + bssid)
+        if sta in self.bssids:
             return
 
-        if not self.stations[sta].eapol_ready:
+        if bssid not in self.bssids:
             return
 
-        self.stations[sta].eapol_ready = False
+        bss = self.bssids[bssid]
+
+        if sta not in bss.stations:
+            printd("bss %s does not know station  %s" % (bss, sta))
+            return
+
+        if not bss.stations[sta].eapol_ready:
+            printd("station %s not eapol ready" % sta)
+            return
+
         eapol_key = EAPOL_KEY(message_2.getlayer(EAPOL).payload.load)
+
         snonce = eapol_key.key_nonce
-        bssid = self.mac
+
         amac = bytes.fromhex(bssid.replace(":", ""))
         smac = bytes.fromhex(sta.replace(":", ""))
 
-        stat = self.stations[sta]
+        stat = bss.stations[sta]
         stat.PMK = PMK = hashlib.pbkdf2_hmac(
-            "sha1", self.PSK.encode(), self.get_ssid().encode(), 4096, 32
+            "sha1", bss.PSK.encode(), bss.ssid.encode(), 4096, 32
         )
+        # UM do we need to sort here
         stat.PTK = PTK = customPRF512(PMK, amac, smac, stat.ANONCE, snonce)
         stat.KCK = PTK[:16]
         stat.KEK = PTK[16:32]
@@ -618,18 +439,50 @@ class AP:
         stat.MIC_STA_TO_AP = PTK[56:64]
         stat.client_iv = count()
 
-        if self.GTK == b"":
-            gen_gtk(self)
+        #verify message 2 key mic matches before proceeding
+        #verify MIC in packet makes sense
+        in_eapol = message_2[EAPOL]
+        ek = EAPOL_KEY(in_eapol.payload.load)
+        given_mic = ek.key_mic
+        to_check = in_eapol.build().replace(ek.key_mic, b"\x00"*len(ek.key_mic))
+        computed_mic = hmac.new(stat.KCK, to_check, hashlib.sha1).digest()[:16]
+        if given_mic != computed_mic:
+            printd("[-] Invalid MIC from STA. Dropping EAPOL key exchange message and station")
+            printd("my bssid " + bssid)
+            printd('my psk ' + bss.PSK)
+            printd('amac ' + bssid)
+            printd('smac ' + sta)
+            printd(b'KCK ' + binascii.hexlify(stat.KCK))
+            printd(b'PMK' + binascii.hexlify(stat.PMK))
+            printd(b'TK' + binascii.hexlify(stat.PTK))
+            printd(b'given mic' + binascii.hexlify(given_mic))
+            printd(b'computed mic' + binascii.hexlify(computed_mic))
+            deauth =    self.get_radiotap_header() \
+                        / Dot11(
+                            addr1=sta,
+                            addr2=bssid,
+                            addr3=bssid
+                        ) \
+                        / Dot11Deauth(reason=1)
+            # relax auth failure
+            #self.sendp(deauth, verbose=False)
+            #del bss.stations[sta]
+            return
+
+        bss.stations[sta].eapol_ready = False
+
+        if bss.GTK == b"":
+            bss.gen_gtk()
 
         stat.KEY_IV = bytes([0 for i in range(16)])
 
         gtk_kde = b"".join(
             [
                 chb(0xDD),
-                chb(len(self.GTK) + 6),
+                chb(len(bss.GTK) + 6),
                 b"\x00\x0f\xac",
                 b"\x01\x00\x00",
-                self.GTK,
+                bss.GTK,
                 b"\xdd\x00",
             ]
         )
@@ -661,25 +514,34 @@ class AP:
                 subtype=0,
                 FCfield="from-DS",
                 addr1=sta,
-                addr2=self.mac,
-                addr3=self.mac,
-                SC=self.next_sc(),
+                addr2=bssid,
+                addr3=bssid,
+                SC=bss.next_sc(),
             )
             / LLC(dsap=0xAA, ssap=0xAA, ctrl=3)
             / SNAP(OUI=0, code=0x888E)
             / ek
         )
 
-        sendp(m3_packet, iface=self.interface, verbose=False)
+        self.sendp(m3_packet, verbose=False)
         stat.associated = True
-        print("[+] New associated station", sta)
+        printd("[+] New associated station %s for bssid %s" % (sta, bssid))
 
-        self.stations[sta] = stat
+        bss.stations[sta] = stat
 
-    def create_message_1(self, sta):
-        if sta not in self.stations:
+    def create_message_1(self, bssid, sta):
+        if sta in self.bssids:
             return
-        stat = self.stations[sta]
+
+        if bssid not in self.bssids:
+            return
+
+        bss = self.bssids[bssid]
+
+        if sta not in bss.stations:
+            return
+
+        stat = bss.stations[sta]
         stat.ANONCE = anonce = bytes([random.randrange(256) for i in range(32)])
         m1_packet = (
             self.get_radiotap_header()
@@ -687,9 +549,9 @@ class AP:
                 subtype=0,
                 FCfield="from-DS",
                 addr1=sta,
-                addr2=self.mac,
-                addr3=self.mac,
-                SC=self.next_sc(),
+                addr2=bssid,
+                addr3=bssid,
+                SC=bss.next_sc(),
             )
             / LLC(dsap=0xAA, ssap=0xAA, ctrl=3)
             / SNAP(OUI=0, code=0x888E)
@@ -706,14 +568,16 @@ class AP:
             )
         )
         stat.eapol_ready = True
-        sendp(m1_packet, iface=self.interface, verbose=False)
-        self.stations[sta] = stat
+        printd("sent eapol m1 " + sta)
+        self.sendp(m1_packet, verbose=False)
+        bss.stations[sta] = stat
 
     def dot11_assoc_resp(self, packet, sta, reassoc):
-        if sta not in self.stations:
-            self.stations[sta] = Station(sta)
+        bssid = packet.addr1
+        bss = self.bssids[bssid]
+        if sta not in bss.stations:
+            bss.stations[sta] = Station(sta)
 
-        self.sta = sta
         response_subtype = 0x01
         if reassoc == 0x02:
             response_subtype = 0x03
@@ -723,49 +587,65 @@ class AP:
             / Dot11(
                 subtype=response_subtype,
                 addr1=sta,
-                addr2=self.mac,
-                addr3=self.mac,
-                SC=self.next_sc(),
+                addr2=bssid,
+                addr3=bssid,
+                SC=bss.next_sc(),
             )
-            / Dot11AssoResp(cap=0x3101, status=0, AID=self.next_aid())
+            / Dot11AssoResp(cap=0x3101, status=0, AID=bss.next_aid())
             / Dot11Elt(ID="Rates", info=AP_RATES)
         )
 
-        print("Sending Association Response (0x01)...")
-        sendp(assoc_packet, iface=self.interface, verbose=False)
-        self.create_message_1(sta)
+        printd("Sending Association Response (0x01)...")
+        self.sendp(assoc_packet, verbose=False)
+        self.create_message_1(bssid, sta)
 
-    def decrypt(self, sta, packet):
+    def decrypt(self, bssid, sta, packet):
+        if bssid not in self.bssids:
+            return
+        bss = self.bssids[bssid]
         ccmp = packet[Dot11CCMP]
         pn = ccmp_pn(ccmp)
-        if sta not in self.stations:
-            print("[-] Unknown station", sta)
-            # TBD: deauth
+        if sta not in bss.stations:
+            printd("[-] Unknown station %s" % sta)
+            deauth =    self.get_radiotap_header() \
+                        / Dot11(
+                            addr1=sta,
+                            addr2=bssid,
+                            addr3=bssid
+                        ) \
+                        / Dot11Deauth(reason=9)
+            self.sendp(deauth, verbose=False)
             return None
-        station = self.stations[sta]
-        return self.decrypt_ccmp(packet, station.TK, self.GTK)
+        station = bss.stations[sta]
+        return self.decrypt_ccmp(packet, station.TK, bss.GTK)
 
-    def encrypt(self, sta, packet, key_idx):
+    def encrypt(self, bss, sta, packet, key_idx):
         key = ""
         if key_idx == 0:
-            pn = next(self.stations[sta].client_iv)
-            key = self.stations[sta].TK
+            pn = next(bss.stations[sta].client_iv)
+            key = bss.stations[sta].TK
         else:
-            pn = next(self.group_IV)
-            key = self.GTK
-        return self.encrypt_ccmp(packet, key, pn, key_idx)
+            pn = next(bss.group_IV)
+            key = bss.GTK
+        return self.encrypt_ccmp(bss, sta, packet, key, pn, key_idx)
 
-    def enc_send(self, sta, packet):
+    def enc_send(self, bss, sta, packet):
         key_idx = 0
         if is_multicast(sta) or is_broadcast(sta):
+            printd('sending broadcast/multicast')
             key_idx = 1
-        elif sta not in self.stations or not self.stations[sta].associated:
-            print("[-] Invalid station", sta)
+        elif sta not in bss.stations or not bss.stations[sta].associated:
+            printd("[-] Invalid station %s" % sta)
             return
-        new_packet = self.get_radiotap_header() / self.encrypt(sta, packet, key_idx)
-        sendp(new_packet, iface=self.interface, verbose=False)
+        x = self.get_radiotap_header()
+        y = self.encrypt(bss, sta, packet, key_idx)
+        if not y:
+            raise Exception("wtfbbq")
+        new_packet = x / y
+        #printd(new_packet.show(dump=1))
+        self.sendp(new_packet, verbose=False)
 
-    def encrypt_ccmp(ap, p, tk, pn, keyid=0, amsdu_spp=False):
+    def encrypt_ccmp(self, bss, sta, p, tk, pn, keyid=0, amsdu_spp=False):
         # Takes a plaintext ethernet frame and encrypt and wrap it into a Dot11/DotCCMP
         # Add the CCMP header. res0 and res1 are by default set to zero.
         SA = p[Ether].src
@@ -773,10 +653,10 @@ class AP:
         newp = Dot11(
             type="Data",
             FCfield="from-DS+protected",
-            addr1=DA,
-            addr2=ap.mac,
+            addr1=sta,
+            addr2=bss.mac,
             addr3=SA,
-            SC=ap.next_sc(),
+            SC=bss.next_sc(),
         )
         newp = newp / Dot11CCMP()
 
@@ -788,13 +668,12 @@ class AP:
         ccm_nonce = ccmp_get_nonce(priority, newp.addr2, pn)
         ccm_aad = ccmp_get_aad(newp, amsdu_spp)
         header = LLC(dsap=0xAA, ssap=0xAA, ctrl=3) / SNAP(OUI=0, code=p[Ether].type)
-        payload = (header / p.payload).build()  # strip ethernet. wrap with LLC
+        payload = (header / p.payload).build()
         ciphertext, tag = CCMPCrypto.run_ccmp_encrypt(tk, ccm_nonce, ccm_aad, payload)
-
         newp.data = ciphertext + tag
         return newp
 
-    def decrypt_ccmp(self, p, tk, gtk, verify=True):
+    def decrypt_ccmp(self, p, tk, gtk, verify=True, dir='to_ap'):
         # Takes a Dot11CCMP frame and decrypts it
         keyid = p.key_id
         if keyid == 0:
@@ -817,23 +696,29 @@ class AP:
             tk, ccm_nonce, ccm_aad, payload, tag
         )
         if verify and not valid:
-            print("[-] ERROR on ccmp decrypt, invalid tag")
+            printd("[-] ERROR on ccmp decrypt, invalid tag")
             return None
         llc = LLC(plaintext)
         # convert into an ethernet packet.
+        # decrypting TO-AP. addr3/addr2.  if doing FROM-AP need to do addr1/addr3
+        DA = p.addr3
+        SA = p.addr2
+        if dir == 'from_ap':
+            DA = p.addr1
+            SA = p.addr3
         return Ether(
-            addr2bin(p.addr3)
-            + addr2bin(p.addr2)
+            addr2bin(DA)
+            + addr2bin(SA)
             + struct.pack(">H", llc.payload.code)
             + llc.payload.payload.build()
         )
 
-    def dot11_beacon(self, ssid):
+    def dot11_beacon(self, bssid, ssid):
         # Create beacon packet
         beacon_packet = (
             self.get_radiotap_header()
             / Dot11(
-                subtype=8, addr1="ff:ff:ff:ff:ff:ff", addr2=self.mac, addr3=self.mac
+                subtype=8, addr1="ff:ff:ff:ff:ff:ff", addr2=bssid, addr3=bssid
             )
             / Dot11Beacon(cap=0x3101)
             / Dot11Elt(ID="SSID", info=ssid)
@@ -847,7 +732,7 @@ class AP:
         beacon_packet[Dot11Beacon].timestamp = self.current_timestamp()
 
         # Send
-        sendp(beacon_packet, iface=self.interface, verbose=False)
+        self.sendp(beacon_packet, verbose=False)
 
     class BeaconTransmitter(threading.Thread):
         def __init__(self, ap):
@@ -858,18 +743,50 @@ class AP:
 
         def run(self):
             while True:
-                for ssid in self.ap.ssids:
-                    self.ap.dot11_beacon(ssid)
+                for bssid in self.ap.bssids.keys():
+                    bss = self.ap.bssids[bssid]
+                    self.ap.dot11_beacon(bss.mac, bss.ssid)
                 # Sleep
                 sleep(self.interval)
 
     def run(self):
         self.beaconTransmitter.start()
-        self.tunnel.start()
-        sniff(iface=self.interface, prn=self.recv_pkt, store=0, filter=self.bpffilter)
+        for x in self.bssids:
+            self.bssids[x].network.start()
+
+        # in iface node, an interface in monitor mode is used
+        # in stdio node, I/O is done via stdin and stdout.
+        if self.mode == "iface":
+            sniff(iface=self.iface, prn=self.recv_pkt, store=0, filter='')
+            return
+
+        assert self.mode == "stdio"
+        os.set_blocking(sys.stdin.fileno(), False)
+
+        qdata = b""
+        while True:
+          sleep(0.01)
+          data = sys.stdin.buffer.read(65536)
+          if data:
+              qdata += data
+          if len(qdata) > 4:
+              wanted = struct.unpack("<L", qdata[:4])[0]
+              if len(qdata) + 4 >= wanted:
+                  p = RadioTap(qdata[4:4 + wanted])
+                  self.recv_pkt(p)
+                  qdata = qdata[4 + wanted:]
+
+    def sendp(self, packet, verbose=False):
+        if self.mode == "stdio":
+            x = packet.build()
+            sys.stdout.buffer.write(struct.pack("<L", len(x)) + x)
+            sys.stdout.buffer.flush()
+            return
+        assert self.mode == "iface"
+        sendp(packet, iface=self.iface, verbose=False)
 
 
 if __name__ == "__main__":
-    ap = AP("mon0", "turtlenet", "password1234")
-    ap.gen_gtk()
+    ap = AP("turtlenet", "password1234", mac="02:00:00:00:00:00", mode="iface", iface="mon0")
+    #ap = AP("turtlenet", "password1234", mac="44:44:44:00:00:00", mode="stdio")
     ap.run()
