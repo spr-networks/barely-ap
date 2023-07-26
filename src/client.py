@@ -19,11 +19,11 @@ from scapy.fields import *
 from scapy.arch import str2mac, get_if_raw_hwaddr
 from ccmp import *
 
-from time import time, sleep
 from ccmp import *
 
 from ap import TunInterface
 from fakenet import ScapyNetwork
+from time import time, sleep
 
 class Level:
     CRITICAL = 0
@@ -129,7 +129,7 @@ def if_hwaddr(iff):
     return str2mac(get_if_raw_hwaddr(iff)[1])
 
 class Client:
-    def __init__(self, ssid, psk, mac=None, mode="stdio", iface="mon1", metmode="tunnel"):
+    def __init__(self, ssid, psk, mac=None, mode="stdio", iface="mon1", netmode="tunnel"):
         self.mode = mode
         self.stations = {}
         self.PSK = psk
@@ -164,7 +164,7 @@ class Client:
 
         if netmode == "tunnel":
             # use a TUN device
-            self.network = TunInterface(self)
+            self.network = TunInterface(self, name=b"scapycli")
         else:
             # use a fake scapy network
             self.network = ScapyNetwork(self) #IP tbd
@@ -349,7 +349,7 @@ class Client:
             decrypted = self.decrypt(packet)
             if decrypted:
                     printd("got decrypted data...")
-                    printd(decrypted.show(dump=1)
+                    printd(decrypted.show(dump=1))
                     self.network.write(decrypted) #packet from AP
 
     def decrypt(self, packet):
@@ -465,5 +465,5 @@ class Client:
 
 if __name__ == "__main__":
     #client = Client("turtlnet", "password1234", mac="66:66:66:66:66:66", mode="stdio")
-    client = Client("turtlnet", "password1234", mac="02:00:00:00:01:00", mode="iface", iface="mon1")
+    client = Client("turtlenet", "password1234", mac="02:00:00:00:01:00", mode="iface", iface="mon1")
     client.run()

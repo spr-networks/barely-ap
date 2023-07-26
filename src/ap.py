@@ -14,14 +14,13 @@ This is built with snippets from several sources:
 3) https://github.com/rpp0/scapy-fakeap
 4) hostapd's testing suite
 """
-
+import sys
 import random
 import hmac, hashlib
 import os
 import fcntl
 
 from itertools import count
-import pyaes
 import threading
 import binascii
 import subprocess
@@ -32,9 +31,9 @@ from scapy.layers.l2 import LLC, SNAP
 from scapy.fields import *
 from scapy.arch import str2mac, get_if_raw_hwaddr
 
-from time import time, sleep
 from fakenet import ScapyNetwork
 from ccmp import *
+from time import time, sleep
 
 
 class Level:
@@ -105,7 +104,7 @@ def set_ip_address(dev, ip):
 
 
 class TunInterface(threading.Thread):
-    def __init__(self, ap, name=b"scapyap"):
+    def __init__(self, bss, ip=None, name=b"scapyap"):
         threading.Thread.__init__(self)
 
         if len(name) > IFNAMSIZ:
@@ -113,7 +112,8 @@ class TunInterface(threading.Thread):
 
         self.name = name
         self.daemon = True
-        self.ap = ap
+        self.bss = bss
+        self.ip = ip
 
         # Virtual interface
         self.fd = os.open("/dev/net/tun", os.O_RDWR)
@@ -122,11 +122,12 @@ class TunInterface(threading.Thread):
         fcntl.ioctl(self.fd, TUNSETIFF, ifreq)  # Syscall to create interface
 
         # Assign IP and bring interface up
-        set_ip_address(name, self.ap.ip)
+        if self.ip:
+          set_ip_address(name, self.ip)
 
         print(
             "Created TUN interface %s at %s. Bind it to your services if needed."
-            % (name, self.ap.ip)
+            % (name, self.ip)
         )
 
     def write(self, pkt):
@@ -145,7 +146,8 @@ class TunInterface(threading.Thread):
     def run(self):
         while True:
             raw_packet = self.read()
-            self.ap.tun_data_incoming(raw_packet)
+            sta = Ether(raw_packet).src
+            self.bss.ap.tun_data_incoming(self.bss, sta, raw_packet)
 
 
 class Station:
@@ -402,7 +404,6 @@ class AP:
         bssid = message_2.getlayer(Dot11).addr1
         sta = message_2.getlayer(Dot11).addr2
 
-        printd("eapol 3 incoming " + sta + " " + bssid)
         if sta in self.bssids:
             return
 

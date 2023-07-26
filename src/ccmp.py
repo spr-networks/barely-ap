@@ -1,4 +1,6 @@
-
+import hashlib, hmac
+from scapy.fields import *
+import pyaes
 
 def pad_key_data(plain):
     pad_len = len(plain) % 8
