@@ -99,12 +99,20 @@ def set_ip_address(dev, ip):
     if subprocess.call(["ip", "addr", "add", ip, "dev", dev]):
         printd("Failed to assign IP address %s to %s." % (ip, dev), Level.CRITICAL)
 
+    if subprocess.call(["ip", "route", "add", "10.10.10.0/24", "dev", dev]): #tbd parse ip and fix subnet
+        printd("Failed to assign IP route 10.10.10.0/24 to %s." % (dev), Level.CRITICAL)
+
+def set_if_up(dev):
     if subprocess.call(["ip", "link", "set", "dev", dev, "up"]):
         printd("Failed to bring device %s up." % dev, Level.CRITICAL)
 
+def set_if_addr(dev, addr):
+    if subprocess.call(["ip", "link", "set", "dev", dev, "addr", addr]):
+        printd("Failed to set device %s add to %s." % (dev, addr), Level.CRITICAL)
+
 
 class TunInterface(threading.Thread):
-    def __init__(self, bss, ip=None, name=b"scapyap"):
+    def __init__(self, bss, ip=None, name="scapyap"):
         threading.Thread.__init__(self)
 
         if len(name) > IFNAMSIZ:
@@ -118,9 +126,12 @@ class TunInterface(threading.Thread):
         # Virtual interface
         self.fd = os.open("/dev/net/tun", os.O_RDWR)
         ifr_flags = IFF_TAP | IFF_NO_PI  # Tun device without packet information
-        ifreq = struct.pack("16sH", name, ifr_flags)
+        ifreq = struct.pack("16sH", name.encode('ascii'), ifr_flags)
         fcntl.ioctl(self.fd, TUNSETIFF, ifreq)  # Syscall to create interface
 
+        set_if_up(name)
+        #update addr
+        set_if_addr(name, self.bss.mac)
         # Assign IP and bring interface up
         if self.ip:
           set_ip_address(name, self.ip)
@@ -146,7 +157,7 @@ class TunInterface(threading.Thread):
     def run(self):
         while True:
             raw_packet = self.read()
-            sta = Ether(raw_packet).src
+            sta = Ether(raw_packet).dst
             self.bss.ap.tun_data_incoming(self.bss, sta, raw_packet)
 
 
@@ -223,7 +234,7 @@ class BSS:
         self.mutex = threading.Lock()
         if mode == "tunnel":
             # use a TUN device
-            self.network = TunInterface(self)
+            self.network = TunInterface(self, ip="10.10.10.1")
         else:
             # use a fake scapy network
             self.network = ScapyNetwork(self, ip=ip)
@@ -636,7 +647,7 @@ class AP:
             printd('sending broadcast/multicast')
             key_idx = 1
         elif sta not in bss.stations or not bss.stations[sta].associated:
-            printd("[-] Invalid station %s" % sta)
+            printd("[-] Invalid station %s for enc_send" % sta)
             return
         x = self.get_radiotap_header()
         y = self.encrypt(bss, sta, packet, key_idx)

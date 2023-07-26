@@ -1,5 +1,7 @@
 import hashlib, hmac
 from scapy.fields import *
+from scapy.layers.dot11 import *
+import binascii
 import pyaes
 
 def pad_key_data(plain):

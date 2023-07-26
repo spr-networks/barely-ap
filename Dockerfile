@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y python3 \
 RUN pip3 install scapy
 
 COPY src/pyaes /pyaes/
-COPY src/ap.py /
+COPY src/*.py /
 
 COPY src/run-ap.sh /
 COPY src/run-cli.sh /
