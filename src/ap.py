@@ -68,8 +68,15 @@ eRSN = Dot11EltRSN(
     akm_suites=AKMSuite(suite="PSK"),
 )
 RSN = eRSN.build()
+country = Dot11Elt(ID='Country', info=(b"\x55\x53\x00\x01\x0b\x17"))
+ht_caps = Dot11EltHTCapabilities()
+ht_info = Dot11Elt(ID=61, info=(b"\x0b\x08\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"))
+extcaps = Dot11Elt(ID='ExtendedCapatibilities', info=(b"\x01\x10\x08\x00\x00\x00\x00\x00"))
 
-AP_RATES = b"\x0c\x12\x18\x24\x30\x48\x60\x6c"
+
+
+#AP_RATES = b"\x0c\x12\x18\x24\x30\x48\x60\x6c"
+AP_RATES = b"\x82\x84\x0b\x16\x96"
 
 DOT11_MTU = 4096
 
@@ -231,6 +238,7 @@ class BSS:
         self.aid = 0
         self.stations = {}
         self.GTK = b""
+        self.group_IV = count()
         self.mutex = threading.Lock()
         if mode == "tunnel":
             # use a TUN device
@@ -387,6 +395,7 @@ class AP:
             / Dot11Elt(ID="SSID", info=ssid)
             / Dot11Elt(ID="Rates", info=AP_RATES)
             / Dot11Elt(ID="DSset", info=chr(self.channel))
+            / country / Dot11EltHTCapabilities()
         )
 
         # If we are an RSN network, add RSN data to response
@@ -604,7 +613,9 @@ class AP:
                 SC=bss.next_sc(),
             )
             / Dot11AssoResp(cap=0x3101, status=0, AID=bss.next_aid())
-            / Dot11Elt(ID="Rates", info=AP_RATES)
+            / Dot11EltRates(rates=[130, 132, 139, 150, 12, 18, 24, 36])
+            / Dot11Elt(ID="DSset", info=chr(self.channel))
+            / country / Dot11EltHTCapabilities()
         )
 
         printd("Sending Association Response (0x01)...")
@@ -734,7 +745,7 @@ class AP:
             )
             / Dot11Beacon(cap=0x3101)
             / Dot11Elt(ID="SSID", info=ssid)
-            / Dot11Elt(ID="Rates", info=AP_RATES)
+            / Dot11EltRates(rates=[130, 132, 139, 150, 12, 18, 24, 36])
             / Dot11Elt(ID="DSset", info=chr(self.channel))
         )
 

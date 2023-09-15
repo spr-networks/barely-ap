@@ -164,7 +164,7 @@ class Client:
 
         if netmode == "tunnel":
             # use a TUN device
-            self.network = TunInterface(self, name=b"scapycli")
+            self.network = TunInterface(self, name="scapycli2")
         else:
             # use a fake scapy network
             self.network = ScapyNetwork(self) #IP tbd
@@ -248,6 +248,8 @@ class Client:
         computed_mic = hmac.new(self.KCK, to_check, hashlib.sha1).digest()[:16]
         if given_mic != computed_mic:
             printd("[-] Invalid MIC from AP. Dropping EAPOL key exchange message %s %s %s" % (packet.addr1, packet.addr2, packet.addr3))
+            printd("%s vs %s" %(computed_mic, given_mic))
+            printd(packet.show(dump=1))
             return
 
         # install GTK from packet
@@ -293,7 +295,12 @@ class Client:
 
     def recv_pkt(self, packet):
         if packet.addr2 == self.mac:
+            printd("drop %s" % packet.addr1)
+            printd(packet.show(dump=1))
             return
+
+        if packet.addr1 != 'ff:ff:ff:ff:ff:ff':
+            printd("got packet in %s" % packet.addr1)
 
         if self.connected == 0:
             if Dot11Beacon in packet:
@@ -461,6 +468,7 @@ class Client:
             return
 
         assert self.mode == "iface"
+        #printd("xmit packet. %s" % packet.addr1)
         sendp(packet, iface=self.iface, verbose=False)
 
 if __name__ == "__main__":
