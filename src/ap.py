@@ -76,7 +76,8 @@ extcaps = Dot11Elt(ID='ExtendedCapatibilities', info=(b"\x01\x10\x08\x00\x00\x00
 
 
 #AP_RATES = b"\x0c\x12\x18\x24\x30\x48\x60\x6c"
-AP_RATES = b"\x82\x84\x0b\x16\x96"
+#AP_RATES = b"\x82\x84\x0b\x16\x96"
+AP_RATES = b"\x82\x84\x8B\x0C\x12\x18\x24"
 
 DOT11_MTU = 4096
 
@@ -268,18 +269,25 @@ class BSS:
         self.MIC_AP_TO_GROUP = self.gtk_full[16:24]
         self.group_IV = count()
 
+def config_mon(iface, channel):
+  """set the interface in monitor mode and then change channel using iw"""
+  os.system("ip link set dev %s down" % iface)
+  os.system("iw dev %s set type monitor" % iface)
+  os.system("ip link set dev %s up" % iface)
+  os.system("iw dev %s set channel %d" % (iface, channel))
 
 class AP:
-    def __init__(self, ssid, psk, mac=None, mode="stdio", iface="wlan0"):
+    def __init__(self, ssid, psk, mac=None, mode="stdio", iface="wlan0", channel=1):
+        self.channel = channel
         self.iface = iface
         self.mode = mode
         if self.mode == "iface":
             mac = if_hwaddr(iface)
+            config_mon(iface, channel)
         if not mac:
           raise Exception("Need a mac")
         else:
           self.mac = mac
-        self.channel = 1
         self.boottime = time()
 
         self.bssids = {mac: BSS(self, ssid, mac, psk, "10.10.0.1/24")}
@@ -348,11 +356,11 @@ class AP:
                     if Dot11Elt in packet:
                         ssid = packet[Dot11Elt].info
 
-                        printd(
-                            "Probe request for SSID %s by MAC %s"
-                            % (ssid, packet.addr2),
-                            Level.DEBUG,
-                        )
+                        #printd(
+                        #    "Probe request for SSID %s by MAC %s"
+                        #    % (ssid, packet.addr2),
+                        #    Level.DEBUG,
+                        #)
 
                         if Dot11Elt in packet and packet[Dot11Elt].len == 0:
                             # for empty return primary ssid
@@ -417,7 +425,7 @@ class AP:
             / Dot11Auth(seqnum=0x02)
         )
 
-        printd("Sending Authentication  from %s to %s (0x0B)..." % (receiver, bssid), Level.DEBUG)
+        printd("Sending Authentication to %s from %s (0x0B)..." % (receiver, bssid), Level.DEBUG)
         self.sendp(auth_packet, verbose=False)
 
     def create_eapol_3(self, message_2):
@@ -486,13 +494,14 @@ class AP:
                         ) \
                         / Dot11Deauth(reason=1)
             # relax auth failure
-            #self.sendp(deauth, verbose=False)
-            #del bss.stations[sta]
+            self.sendp(deauth, verbose=False)
+            del bss.stations[sta]
             return
 
         bss.stations[sta].eapol_ready = False
 
         if bss.GTK == b"":
+            # future: need to regen on each connect and rekey
             bss.gen_gtk()
 
         stat.KEY_IV = bytes([0 for i in range(16)])
@@ -550,7 +559,7 @@ class AP:
 
         bss.stations[sta] = stat
 
-    def create_message_1(self, bssid, sta):
+    def prepare_message_1(self, bssid, sta):
         if sta in self.bssids:
             return
 
@@ -564,7 +573,7 @@ class AP:
 
         stat = bss.stations[sta]
         stat.ANONCE = anonce = bytes([random.randrange(256) for i in range(32)])
-        m1_packet = (
+        stat.m1_packet = (
             self.get_radiotap_header()
             / Dot11(
                 subtype=0,
@@ -589,9 +598,16 @@ class AP:
             )
         )
         stat.eapol_ready = True
+
+    def create_message_1(self, bssid, sta):
+        bss = self.bssids[bssid]
+        stat = bss.stations[sta]
+        if not stat.eapol_ready:
+         printd("[-] eapol was not ready for " + sta)
+         return
+
         printd("sent eapol m1 " + sta)
-        self.sendp(m1_packet, verbose=False)
-        bss.stations[sta] = stat
+        self.sendp(stat.m1_packet, verbose=False)
 
     def dot11_assoc_resp(self, packet, sta, reassoc):
         bssid = packet.addr1
@@ -614,11 +630,13 @@ class AP:
             )
             / Dot11AssoResp(cap=0x3101, status=0, AID=bss.next_aid())
             / Dot11EltRates(rates=[130, 132, 139, 150, 12, 18, 24, 36])
+            / Dot11EltRates(ID=50, rates=[48, 72, 96, 108])
             / Dot11Elt(ID="DSset", info=chr(self.channel))
             / country / Dot11EltHTCapabilities()
         )
 
         printd("Sending Association Response (0x01)...")
+        self.prepare_message_1(bssid, sta)
         self.sendp(assoc_packet, verbose=False)
         self.create_message_1(bssid, sta)
 
@@ -655,6 +673,8 @@ class AP:
     def enc_send(self, bss, sta, packet):
         key_idx = 0
         if is_multicast(sta) or is_broadcast(sta):
+            if len(bss.GTK) == 0:
+              return
             printd('sending broadcast/multicast')
             key_idx = 1
         elif sta not in bss.stations or not bss.stations[sta].associated:
@@ -746,6 +766,7 @@ class AP:
             / Dot11Beacon(cap=0x3101)
             / Dot11Elt(ID="SSID", info=ssid)
             / Dot11EltRates(rates=[130, 132, 139, 150, 12, 18, 24, 36])
+            / Dot11EltRates(ID=50, rates=[48, 72, 96, 108])
             / Dot11Elt(ID="DSset", info=chr(self.channel))
         )
 
@@ -762,7 +783,7 @@ class AP:
             threading.Thread.__init__(self)
             self.ap = ap
             self.daemon = True
-            self.interval = 0.1
+            self.interval = 0.05
 
         def run(self):
             while True:
@@ -810,6 +831,6 @@ class AP:
 
 
 if __name__ == "__main__":
-    ap = AP("turtlenet", "password1234", mac="02:00:00:00:00:00", mode="iface", iface="mon0")
+    ap = AP("turtlenet", "password1234", mode="iface", iface="wlan1", channel=4)
     #ap = AP("turtlenet", "password1234", mac="44:44:44:00:00:00", mode="stdio")
     ap.run()
