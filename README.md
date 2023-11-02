@@ -2,7 +2,7 @@
 
 This is barely an implementation of a WiFi 802.11 Access Point, using Scapy. 
 
-It can run virtuall with mac80211_hwsim or on interfaces in monitor mode. 
+It can run virtually with mac80211_hwsim or on real, actual radio interfaces in monitor mode sending physical signals. 
 
 It has also been used with socat to relay wifi frames over tcp sockets.
 
