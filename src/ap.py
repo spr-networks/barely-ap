@@ -282,7 +282,8 @@ class AP:
         self.iface = iface
         self.mode = mode
         if self.mode == "iface":
-            mac = if_hwaddr(iface)
+            if not mac:
+              mac = if_hwaddr(iface)
             config_mon(iface, channel)
         if not mac:
           raise Exception("Need a mac")
