@@ -1,5 +1,7 @@
 # Barely AP
 
+![image](https://github.com/spr-networks/barely-ap/assets/37549748/767c4706-a62b-41cd-b226-5ffbe05452fa)
+
 This is barely an implementation of a WiFi 802.11 Access Point, using Scapy. 
 
 It can run virtually with mac80211_hwsim or on real, actual radio interfaces in monitor mode sending physical signals. 
