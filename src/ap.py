@@ -277,14 +277,15 @@ def config_mon(iface, channel):
   os.system("iw dev %s set channel %d" % (iface, channel))
 
 class AP:
-    def __init__(self, ssid, psk, mac=None, mode="stdio", iface="wlan0", channel=1):
+    def __init__(self, ssid, psk, mac=None, mode="stdio", iface="wlan0", iface2="", channel=1):
         self.channel = channel
         self.iface = iface
         self.mode = mode
+        if iface2 == "": iface2=iface
         if self.mode == "iface":
             if not mac:
-              mac = if_hwaddr(iface)
-            config_mon(iface, channel)
+              mac = if_hwaddr(iface2)
+            config_mon(iface2, channel)
         if not mac:
           raise Exception("Need a mac")
         else:
@@ -832,6 +833,8 @@ class AP:
 
 
 if __name__ == "__main__":
-    ap = AP("turtlenet", "password1234", mode="iface", iface="wlan1", channel=4)
+    # for nexmon
+    ap = AP("turtlenet", "password1234", mode="iface", iface="mon0", iface2="wlan0", channel=4)
+    #ap = AP("turtlenet", "password1234", mode="iface", iface="wlan1", channel=4)
     #ap = AP("turtlenet", "password1234", mac="44:44:44:00:00:00", mode="stdio")
     ap.run()
