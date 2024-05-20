@@ -404,7 +404,7 @@ class AP:
             )
             / Dot11Elt(ID="SSID", info=ssid)
             / Dot11Elt(ID="Rates", info=AP_RATES)
-            / Dot11Elt(ID="DSset", info=byte([self.channel]))
+            / Dot11Elt(ID="DSset", info=bytes([self.channel]))
             / country / Dot11EltHTCapabilities()
         )
 
@@ -633,7 +633,7 @@ class AP:
             / Dot11AssoResp(cap=0x3101, status=0, AID=bss.next_aid())
             / Dot11EltRates(rates=[130, 132, 139, 150, 12, 18, 24, 36])
             / Dot11EltRates(ID=50, rates=[48, 72, 96, 108])
-            / Dot11Elt(ID="DSset", info=byte([self.channel]))
+            / Dot11Elt(ID="DSset", info=bytes([self.channel]))
             / country / Dot11EltHTCapabilities()
         )
 
@@ -769,7 +769,7 @@ class AP:
             / Dot11Elt(ID="SSID", info=ssid)
             / Dot11EltRates(rates=[130, 132, 139, 150, 12, 18, 24, 36])
             / Dot11EltRates(ID=50, rates=[48, 72, 96, 108])
-            / Dot11Elt(ID="DSset", info=byte([self.channel]))
+            / Dot11Elt(ID="DSset", info=bytes([self.channel]))
         )
 
         beacon_packet = beacon_packet / RSN
