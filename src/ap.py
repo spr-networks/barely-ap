@@ -626,9 +626,9 @@ class AP:
 
         stat = bss.stations[sta]
         if not hasattr(stat, 'ANONCE'):
-          stat.ANONCE = bytes([0 for i in range(32)])
-#gANONCE = bytes([random.randrange(256) for i in range(32)])
-#gANONCE = bytes([42 for i in range(32)])
+          stat.ANONCE = bytes([random.randrange(256) for i in range(32)])
+          #gANONCE = bytes([random.randrange(256) for i in range(32)])
+          #gANONCE = bytes([42 for i in range(32)])
         anonce = stat.ANONCE
         stat.m1_packet = (
             self.get_radiotap_header()
