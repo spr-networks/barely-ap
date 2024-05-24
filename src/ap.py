@@ -35,6 +35,9 @@ from fakenet import ScapyNetwork
 from ccmp import *
 from time import time, sleep
 
+# backoff time for auth per sta
+BACKOFF=0.25
+#BACKOFF=0.00001
 
 class Level:
     CRITICAL = 0
@@ -68,16 +71,28 @@ eRSN = Dot11EltRSN(
     akm_suites=AKMSuite(suite="PSK"),
 )
 RSN = eRSN.build()
-country = Dot11Elt(ID='Country', info=(b"\x55\x53\x00\x01\x0b\x17"))
-ht_caps = Dot11EltHTCapabilities()
-ht_info = Dot11Elt(ID=61, info=(b"\x0b\x08\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"))
-extcaps = Dot11Elt(ID='ExtendedCapatibilities', info=(b"\x01\x10\x08\x00\x00\x00\x00\x00"))
 
+def make_beacon_ies(ssid_name, channel):
+  #tbd hm
+  #ht_caps = Dot11EltHTCapabilities()
+  ##ht_info = Dot11Elt(ID=61, info=(b"\x0b\x08\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"))
+  #extcaps = Dot11Elt(ID='ExtendedCapatibilities', info=(b"\x01\x10\x08\x00\x00\x00\x00\x00"))
 
+  env = b"\x20" #all environments
+  first_channel = bytes([channel])
+  num_channel = bytes([1])
+  power = b"\x17"
+  country = Dot11Elt(ID='Country', info=(b"US" + env + first_channel + num_channel + power))
 
-#AP_RATES = b"\x0c\x12\x18\x24\x30\x48\x60\x6c"
-#AP_RATES = b"\x82\x84\x0b\x16\x96"
-AP_RATES = b"\x82\x84\x8B\x0C\x12\x18\x24"
+  rates = [12, 18, 24, 36, 48, 72, 96, 108]
+  AP_RATES = bytes(rates)
+
+  BEACON_IES = Dot11Elt(ID="SSID", info=ssid_name) \
+              / Dot11Elt(ID="Rates", info=AP_RATES) \
+              / Dot11EltRates(ID=50, rates=rates) \
+              / Dot11Elt(ID="DSset", info=bytes([channel])) \
+              / country
+  return BEACON_IES
 
 DOT11_MTU = 4096
 
@@ -173,6 +188,7 @@ class Station:
     def __init__(self, mac):
         self.mac = mac
         self.associated = False
+        self.eapol_ready = False
 
 # Ripped from scapy-latest with fixes
 class EAPOL_KEY(Packet):
@@ -239,8 +255,17 @@ class BSS:
         self.aid = 0
         self.stations = {}
         self.GTK = b""
+        self.PMK = hashlib.pbkdf2_hmac(
+            "sha1", self.PSK.encode(), self.ssid.encode(), 4096, 32
+        )
+
         self.group_IV = count()
         self.mutex = threading.Lock()
+        self.auth_times = {}
+        self.assoc_times = {}
+
+        #tbd regen this
+        self.gen_gtk()
         if mode == "tunnel":
             # use a TUN device
             self.network = TunInterface(self, ip="10.10.10.1")
@@ -272,9 +297,10 @@ class BSS:
 def config_mon(iface, channel):
   """set the interface in monitor mode and then change channel using iw"""
   os.system("ip link set dev %s down" % iface)
-  os.system("iw dev %s set type monitor" % iface)
+  #os.system("iw dev %s set type monitor" % iface) # this can break driver if overdone
   os.system("ip link set dev %s up" % iface)
   os.system("iw dev %s set channel %d" % (iface, channel))
+  pass
 
 class AP:
     def __init__(self, ssid, psk, mac=None, mode="stdio", iface="wlan0", iface2="", channel=1):
@@ -286,6 +312,7 @@ class AP:
             if not mac:
               mac = if_hwaddr(iface2)
             config_mon(iface2, channel)
+            self.sendy = conf.L2socket(iface=self.iface)
         if not mac:
           raise Exception("Need a mac")
         else:
@@ -296,7 +323,7 @@ class AP:
         self.beaconTransmitter = self.BeaconTransmitter(self)
 
     def ssids(self):
-        return [bss[x].ssid for x in self.bssids]
+        return [self.bssids[x].ssid for x in self.bssids]
 
     def get_radiotap_header(self):
         return RadioTap()
@@ -314,10 +341,19 @@ class AP:
         self.enc_send(bss, sta, p)
 
     def recv_pkt(self, packet):
+        if hasattr(packet, 'addr1'):
+          a = packet.addr1
+          if a != self.mac:
+            if is_multicast(a) or is_broadcast(a):
+              if packet.addr2 == self.mac: return
+            else:
+              return
+        #print("recv", packet)
         try:
             if len(packet.notdecoded[8:9]) > 0:  # Driver sent radiotap header flags
                 # This means it doesn't drop packets with a bad FCS itself
                 flags = ord(packet.notdecoded[8:9])
+                print(packet)
                 if flags & 64 != 0:  # BAD_FCS flag is set
                     # Print a warning if we haven't already discovered this MAC
                     if not packet.addr2 is None:
@@ -329,7 +365,6 @@ class AP:
                     return
 
             if EAPOL in packet:
-                # send message 3
                 self.create_eapol_3(packet)
             elif Dot11CCMP in packet:
                 if packet[Dot11].FCfield == "to-DS+protected":
@@ -351,7 +386,11 @@ class AP:
                     else:
                         printd("failed to decrypt %s to %s" % (sta, bssid))
                     return
-
+            if not hasattr(packet, 'type'):
+              #import code
+              #code.interact(local=locals())
+              # not parsed ;-), could be AWDL
+              return
             # Management
             if packet.type == DOT11_TYPE_MANAGEMENT:
                 if packet.subtype == DOT11_SUBTYPE_PROBE_REQ:  # Probe request
@@ -376,6 +415,8 @@ class AP:
                                     break
                 elif packet.subtype == DOT11_SUBTYPE_AUTH_REQ:  # Authentication
                     bssid = packet.addr1
+                    import code
+                    #code.interact(local=dict(globals(), **locals()))
                     if bssid in self.bssids:  # We are the receivers
                         self.bssids[bssid].sc = -1 # Reset sequence number
                         self.dot11_auth(bssid, packet.addr2)
@@ -385,11 +426,14 @@ class AP:
                 ):
                     if packet.addr1 in self.bssids:
                         self.dot11_assoc_resp(packet, packet.addr2, packet.subtype)
+            #else: print(packet)
+            #elif packet.type == DOT11_TYPE_CONTROL:
+            #  print("control", packet.addr1)
         except SyntaxError as err:
             printd("Unknown error at monitor interface: %s" % repr(err))
 
     def dot11_probe_resp(self, bssid, source, ssid):
-        printd("send probe response to " +  source)
+        #printd("send probe response to " +  source)
         probe_response_packet = (
             self.get_radiotap_header()
             / Dot11(
@@ -402,19 +446,25 @@ class AP:
             / Dot11ProbeResp(
                 timestamp=self.current_timestamp(), beacon_interval=0x0064, cap=0x3101
             )
-            / Dot11Elt(ID="SSID", info=ssid)
-            / Dot11Elt(ID="Rates", info=AP_RATES)
-            / Dot11Elt(ID="DSset", info=bytes([self.channel]))
-            / country / Dot11EltHTCapabilities()
+            / make_beacon_ies(ssid, self.channel)
         )
-
-        # If we are an RSN network, add RSN data to response
         probe_response_packet = probe_response_packet / RSN
 
         self.sendp(probe_response_packet, verbose=False)
 
     def dot11_auth(self, bssid, receiver):
         bss = self.bssids[bssid]
+        t_now = time()
+
+        sta = receiver
+        if receiver in bss.auth_times:
+          t_then = bss.auth_times[sta]
+          if t_now - t_then < BACKOFF:
+            return
+          bss.auth_times[sta] = t_now
+        else:
+          bss.auth_times[sta] = t_now
+
         auth_packet = (
             self.get_radiotap_header()
             / Dot11(
@@ -431,6 +481,7 @@ class AP:
         self.sendp(auth_packet, verbose=False)
 
     def create_eapol_3(self, message_2):
+        t_start = time()
         bssid = message_2.getlayer(Dot11).addr1
         sta = message_2.getlayer(Dot11).addr2
 
@@ -447,7 +498,8 @@ class AP:
             return
 
         if not bss.stations[sta].eapol_ready:
-            printd("station %s not eapol ready" % sta)
+            #printd("station %s not eapol ready" % sta)
+            #message_2.display()
             return
 
         eapol_key = EAPOL_KEY(message_2.getlayer(EAPOL).payload.load)
@@ -458,9 +510,7 @@ class AP:
         smac = bytes.fromhex(sta.replace(":", ""))
 
         stat = bss.stations[sta]
-        stat.PMK = PMK = hashlib.pbkdf2_hmac(
-            "sha1", bss.PSK.encode(), bss.ssid.encode(), 4096, 32
-        )
+        stat.PMK = PMK = bss.PMK
         # UM do we need to sort here
         stat.PTK = PTK = customPRF512(PMK, amac, smac, stat.ANONCE, snonce)
         stat.KCK = PTK[:16]
@@ -477,17 +527,22 @@ class AP:
         given_mic = ek.key_mic
         to_check = in_eapol.build().replace(ek.key_mic, b"\x00"*len(ek.key_mic))
         computed_mic = hmac.new(stat.KCK, to_check, hashlib.sha1).digest()[:16]
+
         if given_mic != computed_mic:
             printd("[-] Invalid MIC from STA. Dropping EAPOL key exchange message and station")
             printd("my bssid " + bssid)
             printd('my psk ' + bss.PSK)
             printd('amac ' + bssid)
             printd('smac ' + sta)
+
+            printd(b'anonce ' + binascii.hexlify(stat.ANONCE))
+            printd(b'snonce ' + binascii.hexlify(snonce))
+
             printd(b'KCK ' + binascii.hexlify(stat.KCK))
-            printd(b'PMK' + binascii.hexlify(stat.PMK))
-            printd(b'TK' + binascii.hexlify(stat.PTK))
-            printd(b'given mic' + binascii.hexlify(given_mic))
-            printd(b'computed mic' + binascii.hexlify(computed_mic))
+            printd(b'PMK ' + binascii.hexlify(stat.PMK))
+            printd(b'PTK ' + binascii.hexlify(stat.PTK))
+            printd(b'given mic ' + binascii.hexlify(given_mic))
+            printd(b'computed mic ' + binascii.hexlify(computed_mic))
             deauth =    self.get_radiotap_header() \
                         / Dot11(
                             addr1=sta,
@@ -499,13 +554,8 @@ class AP:
             self.sendp(deauth, verbose=False)
             del bss.stations[sta]
             return
-
         bss.stations[sta].eapol_ready = False
-
-        if bss.GTK == b"":
-            # future: need to regen on each connect and rekey
-            bss.gen_gtk()
-
+        t1 = time()
         stat.KEY_IV = bytes([0 for i in range(16)])
 
         gtk_kde = b"".join(
@@ -555,10 +605,11 @@ class AP:
             / ek
         )
 
+        t2 = time()
         self.sendp(m3_packet, verbose=False)
         stat.associated = True
-        printd("[+] New associated station %s for bssid %s" % (sta, bssid))
-
+        t_end = time()
+        printd("[+] New associated station %s for bssid %s %f %f %f" % (sta, bssid, t_end-t_start, t1-t_start, t2 - t_start))
         bss.stations[sta] = stat
 
     def prepare_message_1(self, bssid, sta):
@@ -574,7 +625,11 @@ class AP:
             return
 
         stat = bss.stations[sta]
-        stat.ANONCE = anonce = bytes([random.randrange(256) for i in range(32)])
+        if not hasattr(stat, 'ANONCE'):
+          stat.ANONCE = bytes([0 for i in range(32)])
+#gANONCE = bytes([random.randrange(256) for i in range(32)])
+#gANONCE = bytes([42 for i in range(32)])
+        anonce = stat.ANONCE
         stat.m1_packet = (
             self.get_radiotap_header()
             / Dot11(
@@ -617,6 +672,18 @@ class AP:
         if sta not in bss.stations:
             bss.stations[sta] = Station(sta)
 
+        #bss.stations[sta].sent_assoc_resp = True
+        #print("[+] already assoc resp")
+
+        t_now = time()
+        if sta in bss.assoc_times:
+          t_then = bss.assoc_times[sta]
+          if t_now - t_then < BACKOFF:
+            return
+          bss.assoc_times[sta] = t_now
+        else:
+          bss.assoc_times[sta] = t_now
+
         response_subtype = 0x01
         if reassoc == 0x02:
             response_subtype = 0x03
@@ -631,10 +698,7 @@ class AP:
                 SC=bss.next_sc(),
             )
             / Dot11AssoResp(cap=0x3101, status=0, AID=bss.next_aid())
-            / Dot11EltRates(rates=[130, 132, 139, 150, 12, 18, 24, 36])
-            / Dot11EltRates(ID=50, rates=[48, 72, 96, 108])
-            / Dot11Elt(ID="DSset", info=bytes([self.channel]))
-            / country / Dot11EltHTCapabilities()
+            / make_beacon_ies(self.ssids()[0], self.channel)
         )
 
         printd("Sending Association Response (0x01)...")
@@ -683,11 +747,13 @@ class AP:
             printd("[-] Invalid station %s for enc_send" % sta)
             return
         x = self.get_radiotap_header()
+        #print("send", packet)
         y = self.encrypt(bss, sta, packet, key_idx)
         if not y:
             raise Exception("wtfbbq")
         new_packet = x / y
         #printd(new_packet.show(dump=1))
+        #print("send CCMP", key_idx, new_packet)
         self.sendp(new_packet, verbose=False)
 
     def encrypt_ccmp(self, bss, sta, p, tk, pn, keyid=0, amsdu_spp=False):
@@ -766,10 +832,7 @@ class AP:
                 subtype=8, addr1="ff:ff:ff:ff:ff:ff", addr2=bssid, addr3=bssid
             )
             / Dot11Beacon(cap=0x3101)
-            / Dot11Elt(ID="SSID", info=ssid)
-            / Dot11EltRates(rates=[130, 132, 139, 150, 12, 18, 24, 36])
-            / Dot11EltRates(ID=50, rates=[48, 72, 96, 108])
-            / Dot11Elt(ID="DSset", info=bytes([self.channel]))
+            / make_beacon_ies(ssid, self.channel)
         )
 
         beacon_packet = beacon_packet / RSN
@@ -811,7 +874,7 @@ class AP:
 
         qdata = b""
         while True:
-          sleep(0.01)
+          sleep(0.01) 
           data = sys.stdin.buffer.read(65536)
           if data:
               qdata += data
@@ -830,11 +893,13 @@ class AP:
             return
         assert self.mode == "iface"
         sendp(packet, iface=self.iface, verbose=False)
+        #self.sendy.send(packet)
 
 
 if __name__ == "__main__":
-    # for nexmon
-    ap = AP("turtlenet", "password1234", mode="iface", iface="mon0", iface2="wlan0", channel=4)
+    ap = AP("turtlenet", "password1234", mode="iface", iface="wlan3", channel=4)
+    #nexmon example:
+    # ap = AP("turtlenet", "password1234", mode="iface", iface="mon0", iface2="wlan2", channel=4)
     #ap = AP("turtlenet", "password1234", mode="iface", iface="wlan1", channel=4)
     #ap = AP("turtlenet", "password1234", mac="44:44:44:00:00:00", mode="stdio")
     ap.run()
