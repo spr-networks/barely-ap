@@ -892,8 +892,9 @@ class AP:
             sys.stdout.buffer.flush()
             return
         assert self.mode == "iface"
-        sendp(packet, iface=self.iface, verbose=False)
-        #self.sendy.send(packet)
+        #sendp(packet, iface=self.iface, verbose=False)
+        #L2 sock is faster
+        self.sendy.send(packet)
 
 
 if __name__ == "__main__":
