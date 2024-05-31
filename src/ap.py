@@ -84,7 +84,7 @@ def make_beacon_ies(ssid_name, channel):
   power = b"\x17"
   country = Dot11Elt(ID='Country', info=(b"US" + env + first_channel + num_channel + power))
 
-  rates = [12, 18, 24, 36, 48, 72, 96, 108]
+  rates = [0x82, 0x84, 0x0b, 0x16]
   AP_RATES = bytes(rates)
 
   BEACON_IES = Dot11Elt(ID="SSID", info=ssid_name) \
