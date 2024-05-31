@@ -55,7 +55,8 @@ eRSN = Dot11EltRSN(
 )
 RSN = eRSN.build()
 
-AP_RATES = b"\x0c\x12\x18\x24\x30\x48\x60\x6c"
+#AP_RATES = b"\x0c\x12\x18\x24\x30\x48\x60\x6c"
+AP_RATES = b"\x82\x84\x0b\x16"
 
 DOT11_MTU = 4096
 
