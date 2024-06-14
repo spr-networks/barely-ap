@@ -169,6 +169,27 @@ class Client:
         else:
             # use a fake scapy network
             self.network = ScapyNetwork(self) #IP tbd
+        self.ap = self #for tun_data_incoming
+        self.network.start()
+
+    def tun_data_incoming(self, bss, sta, incoming):
+        p = Ether(incoming)
+        self.enc_send(p)
+
+    def enc_send(self, packet):
+        key_idx = 0
+        if is_multicast(packet[Ether].dst) or is_broadcast(packet[Ether].dst):
+            printd('sending broadcast/multicast')
+            key_idx = 1
+        x = self.get_radiotap_header()
+        #print("send", packet)
+        y = self.encrypt(packet, key_idx)
+        if not y:
+            raise Exception("wtfbbq")
+        new_packet = x / y
+        #printd(new_packet.show(dump=1))
+        #print("send CCMP", key_idx, new_packet)
+        self.sendp(new_packet, verbose=False)
 
     def get_radiotap_header(self):
         return RadioTap()
