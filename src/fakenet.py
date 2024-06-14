@@ -3,6 +3,17 @@ import threading
 from scapy.layers.dhcp import *
 from scapy.layers.inet import *
 from scapy.layers.l2 import ARP
+import sys
+
+class Level:
+    CRITICAL = 0
+    WARNING = 1
+    INFO = 2
+    DEBUG = 3
+    BLOAT = 4
+
+
+VERBOSITY = Level.BLOAT
 
 class ScapyNetwork(threading.Thread):
     def __init__(self, bss, ip="10.10.10.1/24"):
