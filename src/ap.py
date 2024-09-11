@@ -410,7 +410,7 @@ class AP:
                             # otherwise return match
                             for x in self.bssids:
                                 # otherwise only respond to a match
-                                if self.bssids[x].ssid == ssid:
+                                if self.bssids[x].ssid.encode('ascii') == ssid:
                                     self.dot11_probe_resp(x, packet.addr2, ssid)
                                     break
                 elif packet.subtype == DOT11_SUBTYPE_AUTH_REQ:  # Authentication
